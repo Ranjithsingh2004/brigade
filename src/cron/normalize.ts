@@ -93,6 +93,8 @@ const RELATIVE_OFFSET_FIELDS: ReadonlyArray<readonly [string, number]> = [
 	["inhrs", 3_600_000],
 	["inday", 86_400_000],
 	["indays", 86_400_000],
+	["inweek", 604_800_000],
+	["inweeks", 604_800_000],
 ];
 
 /** Sum every recognised relative-offset field (case-insensitive). Returns
@@ -131,7 +133,7 @@ export function resolveRelativeScheduleInput(raw: unknown, nowMs: number): unkno
 	if (offsetMs === undefined) {
 		throw new Error(
 			'cron relative schedule (kind "in") requires a positive offset — ' +
-				"one of inSeconds / inMinutes / inHours / inDays / inMs",
+				"one of inSeconds / inMinutes / inHours / inDays / inWeeks / inMs",
 		);
 	}
 	if (offsetMs <= 0) {
