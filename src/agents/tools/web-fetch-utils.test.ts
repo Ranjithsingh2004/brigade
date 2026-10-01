@@ -76,6 +76,58 @@ describe("sanitizeHtml", () => {
 		assert.ok(!/b<\/span>/.test(out));
 		assert.ok(/ok<\/span>/.test(out));
 	});
+
+	it("strips nested same-tag hidden elements (prompt-injection bypass)", () => {
+		// An attacker wraps a hidden outer div around an inner same-tag div.
+		// Before the fixpoint-loop fix, the non-greedy regex stopped at the
+		// first </div> (inner), leaving the payload between inner-close and
+		// outer-close visible in the extracted markdown.
+		const html = `<div hidden><div>inner</div> INJECTED_PAYLOAD </div><p>safe</p>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/INJECTED_PAYLOAD/.test(out), "payload between inner and outer close tag must be stripped");
+		assert.ok(!/inner/.test(out), "inner content of hidden container must be stripped");
+		assert.ok(/safe/.test(out));
+	});
+
+	it("strips deeply nested hidden elements (three levels)", () => {
+		const html = `<div hidden><div><div>deep</div> mid </div> outer </div><span>ok</span>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/deep/.test(out));
+		assert.ok(!/mid/.test(out));
+		assert.ok(!/outer/.test(out));
+		assert.ok(/ok/.test(out));
+	});
+
+	it("strips nested aria-hidden elements", () => {
+		const html = `<span aria-hidden="true"><span>inner</span> LEAKED </span><b>visible</b>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/LEAKED/.test(out));
+		assert.ok(!/inner/.test(out));
+		assert.ok(/visible/.test(out));
+	});
+
+	it("strips nested sr-only class elements", () => {
+		const html = `<div class="sr-only"><div>nested</div> payload </div><p>shown</p>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/payload/.test(out));
+		assert.ok(!/nested/.test(out));
+		assert.ok(/shown/.test(out));
+	});
+
+	it("strips nested display:none inline-style elements", () => {
+		const html = `<div style="display:none"><div>inner</div> HIDDEN </div><span>ok</span>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/HIDDEN/.test(out));
+		assert.ok(!/inner/.test(out));
+		assert.ok(/ok/.test(out));
+	});
+
+	it("strips color:transparent trick (invisible text)", () => {
+		const html = `<span style="color:transparent">invisible instructions</span><span>real</span>`;
+		const out = sanitizeHtml(html);
+		assert.ok(!/invisible instructions/.test(out));
+		assert.ok(/real/.test(out));
+	});
 });
 
 describe("stripInvisibleUnicode", () => {

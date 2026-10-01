@@ -152,25 +152,84 @@ export function sanitizeHtml(html: string): string {
 	return out;
 }
 
+/**
+ * Strip balanced HTML elements. A regex non-greedy `[\\s\\S]*?` fails on nested
+ * same-tag elements (it matches the first closing tag, leaving outer contents dangling).
+ * This scans forward accounting for nesting depth, safely removing the entire block.
+ */
+function stripBalancedElement(html: string, openRegex: RegExp, condition?: (match: RegExpExecArray) => boolean): string {
+	let out = "";
+	let pos = 0;
+	const flags = openRegex.flags.includes("g") ? openRegex.flags : openRegex.flags + "g";
+	const re = new RegExp(openRegex.source, flags);
+
+	while (true) {
+		re.lastIndex = pos;
+		const match = re.exec(html);
+		if (!match) {
+			out += html.slice(pos);
+			break;
+		}
+
+		if (condition && !condition(match)) {
+			const endOfOpenTag = match.index + match[0].length;
+			out += html.slice(pos, endOfOpenTag);
+			pos = endOfOpenTag;
+			continue;
+		}
+
+		out += html.slice(pos, match.index);
+
+		const tagName = (match[1] || "").toLowerCase();
+		let depth = 1;
+		let searchPos = match.index + match[0].length;
+		const tagRegex = new RegExp(`<(\\/)?${tagName}\\b[^>]*>`, "gi");
+		tagRegex.lastIndex = searchPos;
+
+		let foundClose = false;
+		while (true) {
+			const tagMatch = tagRegex.exec(html);
+			if (!tagMatch) break;
+
+			if (tagMatch[1] === "/") {
+				depth--;
+			} else {
+				depth++;
+			}
+
+			if (depth === 0) {
+				pos = tagMatch.index + tagMatch[0].length;
+				foundClose = true;
+				break;
+			}
+		}
+
+		if (!foundClose) {
+			// Unbalanced or malformed, just strip the opening tag to be safe.
+			pos = match.index + match[0].length;
+		}
+	}
+	return out;
+}
+
 /** Drop elements where attribute `attrName` is present (optionally with `value`). */
 function stripHiddenByAttribute(html: string, attrName: string, value?: string): string {
-	// Matches <tag … attrName=…>…</tag> (loose; doesn't recurse into nested same-tag).
 	const valPart = value ? `=["']${value}["']` : `(?:=["'][^"']*["'])?`;
 	const re = new RegExp(
-		`<([a-z][a-z0-9-]*)\\b[^>]*\\b${attrName}\\b${valPart}[^>]*>[\\s\\S]*?<\\/\\1>`,
+		`<([a-z][a-z0-9-]*)\\b[^>]*\\b${attrName}\\b${valPart}[^>]*>`,
 		"gi",
 	);
-	return html.replace(re, "");
+	return stripBalancedElement(html, re);
 }
 
 /** Drop elements whose class attribute matches one of the hidden-class hints. */
 function stripHiddenByClass(html: string): string {
 	const hintRe = HIDDEN_CLASS_HINTS.map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 	const re = new RegExp(
-		`<([a-z][a-z0-9-]*)\\b[^>]*class=["'][^"']*\\b(?:${hintRe})\\b[^"']*["'][^>]*>[\\s\\S]*?<\\/\\1>`,
+		`<([a-z][a-z0-9-]*)\\b[^>]*class=["'][^"']*\\b(?:${hintRe})\\b[^"']*["'][^>]*>`,
 		"gi",
 	);
-	return html.replace(re, "");
+	return stripBalancedElement(html, re);
 }
 
 /** Drop elements whose inline `style` looks hidden. */
@@ -194,9 +253,10 @@ function stripHiddenByInlineStyle(html: string): string {
 		// but also used by injection attacks to smuggle text).
 		/width\s*:\s*0\s*(?:px|em|%)?\s*;\s*height\s*:\s*0/i,
 	];
-	const re = /<([a-z][a-z0-9-]*)\b[^>]*style=["']([^"']*)["'][^>]*>[\s\S]*?<\/\1>/gi;
-	return html.replace(re, (match, _tag, style: string) => {
-		return hiddenStyleHints.some((h) => h.test(style)) ? "" : match;
+	const re = /<([a-z][a-z0-9-]*)\b[^>]*style=["']([^"']*)["'][^>]*>/gi;
+	return stripBalancedElement(html, re, (match) => {
+		const style = match[2] || "";
+		return hiddenStyleHints.some((h) => h.test(style));
 	});
 }
 
@@ -208,35 +268,22 @@ function stripHiddenByInlineStyle(html: string): string {
  * &#8203;-style entities that decode to invisible chars).
  */
 export function stripInvisibleUnicode(text: string): string {
-	// Build the regex from numeric ranges at runtime — avoids any chance
-	// of literal-codepoint regex classes being mangled by editor encoding.
-	// Covers (in order): zero-width space + joiner + non-joiner + RTL/LTR
+	// Single regex covering all invisible ranges. Built from Unicode property
+	// escapes where possible, with explicit ranges for the supplementary-plane
+	// tag-namespace block (U+E0000..U+E007F). The `u` flag enables surrogate-
+	// pair-aware matching so supplementary codepoints are handled correctly.
+	//
+	// Ranges (in order): zero-width space + joiner + non-joiner + RTL/LTR
 	// marks (U+200B..U+200F); embedding/pop/override (U+202A..U+202E);
 	// word joiner + invisible-math operators + function-application
 	// (U+2060..U+2065); isolate marks (U+2066..U+2069); deprecated
 	// inhibit/activate-formatting (U+206A..U+206F); BOM (U+FEFF);
 	// tag-namespace characters used in invisible-tag attacks
-	// (U+E0000..U+E007F). All ranges close on the visible end of common
-	// prompt-injection-via-glyph attacks.
-	const bmpRanges: ReadonlyArray<readonly [number, number]> = [
-		[0x200B, 0x200F],
-		[0x202A, 0x202E],
-		[0x2060, 0x2065],
-		[0x2066, 0x2069],
-		[0x206A, 0x206F],
-		[0xFEFF, 0xFEFF],
-	];
-	const out: string[] = [];
-	for (const ch of text) {
-		const code = ch.codePointAt(0) ?? 0;
-		let drop = false;
-		for (const range of bmpRanges) {
-			if (code >= range[0] && code <= range[1]) { drop = true; break; }
-		}
-		if (!drop && code >= 0xE0000 && code <= 0xE007F) drop = true;
-		if (!drop) out.push(ch);
-	}
-	return out.join("");
+	// (U+E0000..U+E007F).
+	return text.replace(
+		/[\u200B-\u200F\u202A-\u202E\u2060-\u2065\u2066-\u2069\u206A-\u206F\uFEFF]|[\uDB40][\uDC00-\uDC7F]/g,
+		"",
+	);
 }
 
 /**
