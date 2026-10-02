@@ -172,7 +172,9 @@ describe("bundled job-search skill (shipped assets)", () => {
 			const db = path.join(work, "ledger.json");
 			const t = (args: string[]): Promise<TrackerResult> => runTracker(["--db", db, ...args], work);
 			assert.equal((await t(["add", "--company", "Acme"])).code, 1, "add without --role is a usage error (exit 1)");
-			assert.equal(fs.existsSync(db), false, "a usage error must not create a ledger file");
+			// Directory listing, not existsSync: a usage error must not create the
+			// ledger file (and this avoids a check-then-act pattern on the path).
+			assert.ok(!fs.readdirSync(work).includes("ledger.json"), "a usage error must not create a ledger file");
 			const seeded = await t(["add", "--company", "Acme", "--role", "Eng"]);
 			assert.equal(seeded.code, 0, `seeding failed: ${seeded.stderr}`);
 
