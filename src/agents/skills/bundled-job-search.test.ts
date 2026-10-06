@@ -1,9 +1,9 @@
 /**
  * Guards the bundled `job-search` skill — the SHIPPED assets, not fixtures.
  *
- * The skill is data + a script, so nothing else in the suite exercises it;
+ * The skill is data + scripts, so nothing else in the suite exercises it;
  * without these checks a broken frontmatter or a syntax-errored tracker
- * script would only surface at a user's first hunt. Two layers:
+ * script would only surface at a user's first hunt. Three layers:
  *
  *   1. Discovery + spec conformance — the skill is found via the real bundled
  *      root, its frontmatter satisfies the Agent Skills validation Pi applies
@@ -13,6 +13,10 @@
  *      the shipped ledger through its full loop (add → list → update →
  *      followups → stats → remove) plus its error contract (usage errors vs.
  *      data errors, distinct exit codes).
+ *   3. The dashboard server serves that same ledger — the shipped script is
+ *      booted for real and probed over loopback (read-only pages, JSON data,
+ *      HTML escaping, 404/405, fresh reads after tracker writes, and its
+ *      exit-code contract).
  */
 
 import { strict as assert } from "node:assert";
@@ -56,6 +60,46 @@ interface TrackerResult {
 	code: number;
 	stdout: string;
 	stderr: string;
+}
+
+/** Minimal HTTP probe helper for the dashboard server. */
+async function fetchProbe(url: string, init?: RequestInit): Promise<{ status: number; contentType: string; text: string }> {
+	const res = await fetch(url, init);
+	return { status: res.status, contentType: res.headers.get("content-type") ?? "", text: await res.text() };
+}
+
+/**
+ * Start the shipped dashboard on a fixed loopback port (default 3219) and
+ * wait until /healthz answers; returns the base URL and a stop handle.
+ */
+async function startDashboard(dbPath: string, port = 3219): Promise<{ base: string; stop: () => Promise<void>; exitCode: Promise<number> }> {
+	const child = execFile(process.execPath, [skillFile("scripts", "dashboard.mjs"), "--db", dbPath, "--port", String(port)], { encoding: "utf8" });
+	const exitCode = new Promise<number>((resolve) => {
+		child.on("exit", (code, signal) => resolve(code ?? (signal === null ? -1 : -2)));
+	});
+	const base = `http://127.0.0.1:${port}`;
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		try {
+			const res = await fetch(`${base}/healthz`);
+			if (res.ok) break;
+		} catch {
+			// not listening yet — retry until the deadline
+		}
+		if (Date.now() > deadline) {
+			child.kill();
+			throw new Error(`dashboard did not become ready within 10s (port ${port})`);
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	return {
+		base,
+		stop: async () => {
+			child.kill();
+			await new Promise((r) => setTimeout(r, 150));
+		},
+		exitCode,
+	};
 }
 
 /** Run the shipped tracker as a real child process; never throws on nonzero exit. */
@@ -194,6 +238,126 @@ describe("bundled job-search skill (shipped assets)", () => {
 			const corrupt = await t(["stats"]);
 			assert.equal(corrupt.code, 2, "a corrupt ledger is a data error (exit 2)");
 			assert.match(corrupt.stderr, /is corrupt/);
+		} finally {
+			fs.rmSync(work, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("bundled job-search skill: ledger dashboard (shipped server)", () => {
+	it("serves the ledger read-only: funnel, follow-ups, escaping, and JSON data", async () => {
+		const work = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-job-search-dash-"));
+		try {
+			const db = path.join(work, "applications.json");
+			const t = (args: string[]): Promise<TrackerResult> => runTracker(["--db", db, ...args], work);
+			assert.equal((await t(["add", "--company", "Acme & Sons", "--role", 'Backend "Engineer"'])).code, 0);
+			assert.equal((await t(["update", "1", "--status", "interview", "--notes", "screen scheduled"])).code, 0);
+			assert.equal((await t(["add", "--company", "Globex", "--role", "Platform Eng", "--date", isoDaysAgo(9)])).code, 0);
+
+			const dash = await startDashboard(db);
+			try {
+				const page = await fetchProbe(`${dash.base}/`);
+				assert.equal(page.status, 200);
+				assert.match(page.contentType, /text\/html/);
+				// Ledger values are user data; the page must render them inert.
+				assert.ok(page.text.includes("Acme &amp; Sons"), "company must be HTML-escaped");
+				assert.ok(page.text.includes("&quot;Engineer&quot;"), "quotes in the role must be HTML-escaped");
+				assert.ok(!page.text.includes("Acme & Sons"), "raw unescaped ledger text must never appear");
+				assert.ok(page.text.includes("Needs attention"), "stale section must be present");
+				assert.ok(page.text.includes("Globex"), "the stale record must be listed");
+
+				const css = await fetchProbe(`${dash.base}/style.css`);
+				assert.equal(css.status, 200);
+				assert.match(css.contentType, /text\/css/);
+
+				const data = await fetchProbe(`${dash.base}/data`);
+				assert.equal(data.status, 200);
+				assert.match(data.contentType, /application\/json/);
+				const payload = JSON.parse(data.text) as {
+					stats: { total: number; responses: number; responseRate: string };
+					followups: Array<{ id: string }>;
+					records: Array<{ id: string; status: string; company: string }>;
+				};
+				assert.equal(payload.stats.total, 2);
+				assert.equal(payload.stats.responses, 1, "only the interview record counts as a response");
+				assert.equal(payload.stats.responseRate, "50%");
+				assert.deepEqual(payload.followups.map((f) => f.id), ["2"], "only the 9-day-stale record needs attention");
+
+				// The dashboard is strictly read-only: serving must not rewrite
+				// the ledger, and edits remain the tracker's job.
+				const before = fs.readFileSync(db, "utf8");
+				await fetchProbe(`${dash.base}/`);
+				await fetchProbe(`${dash.base}/data`);
+				assert.equal(fs.readFileSync(db, "utf8"), before, "serving pages must not rewrite the ledger");
+				assert.equal((await t(["update", "2", "--status", "screening"])).code, 0);
+				const after = await fetchProbe(`${dash.base}/data`);
+				const payload2 = JSON.parse(after.text) as { records: Array<{ id: string; status: string }> };
+				assert.equal(payload2.records.find((r) => r.id === "2")?.status, "screening", "a tracker edit must be visible on the next request (no caching)");
+			} finally {
+				await dash.stop();
+			}
+		} finally {
+			fs.rmSync(work, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the route surface tight and rejects non-GET methods", async () => {
+		const work = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-job-search-dash-routes-"));
+		try {
+			const db = path.join(work, "applications.json");
+			assert.equal((await runTracker(["--db", db, "add", "--company", "Initech", "--role", "SRE"], work)).code, 0);
+			const dash = await startDashboard(db, 3220);
+			try {
+				assert.equal((await fetchProbe(`${dash.base}/healthz`)).status, 200);
+				assert.equal((await fetchProbe(`${dash.base}/nope/nope`)).status, 404);
+				// A path-traversal lookup must stay inside the fixed route table.
+				assert.equal((await fetchProbe(`${dash.base}/..%2fpackage.json`)).status, 404);
+				const post = await fetchProbe(`${dash.base}/`, { method: "POST" });
+				assert.equal(post.status, 405, "writes must be refused — the dashboard never mutates");
+				assert.equal((await fetchProbe(`${dash.base}/`, { method: "DELETE" })).status, 405);
+			} finally {
+				await dash.stop();
+			}
+		} finally {
+			fs.rmSync(work, { recursive: true, force: true });
+		}
+	});
+
+	it("exits 0 with --help, 1 on usage errors, and 2 on a corrupt ledger before binding", async () => {
+		const work = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-job-search-dash-err-"));
+		try {
+			const db = path.join(work, "applications.json");
+			const run = (args: string[]): Promise<TrackerResult> =>
+				new Promise((resolve) => {
+					execFile(process.execPath, [skillFile("scripts", "dashboard.mjs"), ...args], { encoding: "utf8" }, (err, stdout, stderr) => {
+						if (err === null) {
+							resolve({ code: 0, stdout: String(stdout), stderr: String(stderr) });
+							return;
+						}
+						const raw = (err as NodeJS.ErrnoException).code;
+						const code = typeof raw === "number" ? raw : Number(raw);
+						resolve({ code: Number.isFinite(code) ? code : 1, stdout: String(stdout), stderr: String(stderr) });
+					});
+				});
+			const help = await run(["--help"]);
+			assert.equal(help.code, 0);
+			assert.match(help.stdout, /Usage: dashboard\.mjs/);
+
+			const badFlag = await run(["--bogus"]);
+			assert.equal(badFlag.code, 1, "unknown flags are usage errors");
+			const badPort = await run(["--port", "99999"]);
+			assert.equal(badPort.code, 1, "out-of-range ports are usage errors");
+			assert.match(badPort.stderr, /--port must be a whole number/);
+
+			fs.writeFileSync(db, '{"oops":true}\n', "utf8");
+			const corrupt = await run(["--db", db, "--port", "3221"]);
+			assert.equal(corrupt.code, 2, "a corrupt ledger is a data error (exit 2)");
+			assert.match(corrupt.stderr, /is corrupt/);
+			const listening = await fetchProbe("http://127.0.0.1:3221/healthz").then(
+				() => true,
+				() => false,
+			);
+			assert.equal(listening, false, "a corrupt ledger must not leave a server listening");
 		} finally {
 			fs.rmSync(work, { recursive: true, force: true });
 		}

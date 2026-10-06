@@ -29,6 +29,17 @@ node {baseDir}/scripts/tracker.mjs show 3                     # full record + hi
 node {baseDir}/scripts/tracker.mjs remove 3                   # only when the user asks
 ```
 
+### Web dashboard
+
+`dashboard.mjs` serves the same ledger as a small read-only web page (funnel, response rate, follow-ups, full table) for the user's browser:
+
+```bash
+node {baseDir}/scripts/dashboard.mjs            # binds 127.0.0.1 on an ephemeral port, prints the URL
+node {baseDir}/scripts/dashboard.mjs --db <path> --port 7691   # when the ledger is elsewhere
+```
+
+It re-reads the file on every refresh (auto-refreshes every 30s) so tracker edits appear immediately. It is strictly read-only — the dashboard never writes the ledger — and binds to loopback only, so nothing outside the machine can reach it. Tell the user the URL and let them open it; don't screen-scrape it yourself, use `tracker.mjs list/stats` for that.
+
 Statuses, in pipeline order: `applied` → `screening` → `interview` → `offer` → `accepted`, plus `rejected` / `withdrawn` (terminal). `--json` on list/show/followups/stats when you need to process the output further.
 
 ## Workflow
