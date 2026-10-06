@@ -123,12 +123,21 @@ test("acquireSessionWriteLock: fresh unparseable lockfile is treated as a peer m
     () => acquireSessionWriteLock({ sessionFile, timeoutMs: 300 }),
     /Timed out waiting for session write lock/,
   );
-  // Still on disk — nothing stole it.
-  assert.ok(await fs.stat(lockPath), "a fresh unparseable lock must survive the grace window");
+  // Still on disk — nothing stole it (directory listing, not a stat of the
+  // same path we touch below, avoiding a check-then-act pattern).
+  assert.ok((await fs.readdir(path.dirname(lockPath))).includes(path.basename(lockPath)), "a fresh unparseable lock must survive the grace window");
 
-  // Old + unparseable = corrupt leftovers → stealable as before.
+  // Old + unparseable = corrupt leftovers → stealable as before. The lock
+  // was created inside the grace window seconds ago; backdate it past
+  // STALE_LOCK_MS so the steal triggers on age.
+  const lockFile = path.join(path.dirname(lockPath), path.basename(lockPath));
   const ancient = new Date(Date.now() - 11 * 60_000);
-  await fs.utimes(lockPath, ancient, ancient);
+  const handle = await fs.open(lockFile, "r+");
+  try {
+    await handle.utimes(ancient, ancient);
+  } finally {
+    await handle.close();
+  }
   const lock = await acquireSessionWriteLock({ sessionFile, timeoutMs: 5_000 });
   const stolen = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number };
   assert.equal(stolen.pid, process.pid, "an ancient unparseable lock must still be stealable");
